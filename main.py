@@ -5,11 +5,17 @@ Run locally with:
     uvicorn main:app --reload --port 8000
 
 Endpoints:
-    POST /api/pipeline   { "complaint_text": "..." }  -> full recommendation
-    GET  /api/health      -> {"status": "ok"}
+    POST /api/pipeline          { "complaint_text": "..." }  -> full recommendation
+    GET  /api/health             -> {"status": "ok"}
+
+    POST   /api/complaints       -> create/save a complaint (shared DB, not localStorage)
+    GET    /api/complaints       -> list all complaints (for officer dashboard)
+    GET    /api/complaints/{id}  -> fetch one complaint (for citizen tracking)
+    PATCH  /api/complaints/{id}  -> officer updates status / notes
 """
 
 import os
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -18,8 +24,9 @@ from pydantic import BaseModel
 
 from decision_table import find_missing_fields, recommend_action, generate_explanation
 from groq_client import extract_fields, GroqError
+from database import Complaint, get_session, init_db, serialize
 
-load_dotenv()  # reads GROQ_API_KEY from .env
+load_dotenv()  # reads GROQ_API_KEY (and DATABASE_URL) from .env
 
 app = FastAPI(title="NagrikSeva Enterprise API")
 
@@ -31,6 +38,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def on_startup():
+    # Creates the complaints table if it doesn't exist yet. Safe no-op if
+    # DATABASE_URL isn't set — /api/complaints routes will just fail with a
+    # clear error instead of crashing the whole app.
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[startup] Database init skipped/failed: {e}")
 
 
 class ComplaintRequest(BaseModel):
@@ -77,6 +95,87 @@ def run_pipeline(req: ComplaintRequest):
         "recommendation": rec,
         "explanation": explanation,
     }
+
+
+# ---------------------------------------------------------------------------
+# Complaints database — shared storage so citizens and officers see the same
+# data (this replaces the old per-browser localStorage complaint history).
+# ---------------------------------------------------------------------------
+
+class ComplaintCreate(BaseModel):
+    id: str
+    description: str
+    location: Optional[str] = None
+    department: Optional[str] = None
+    category: Optional[str] = None
+    recommended_action: Optional[str] = None
+    portal: Optional[str] = None
+    statutory_days: Optional[str] = None
+    priority: Optional[str] = None
+    status: str = "Submitted"
+    fields: Optional[dict] = None
+    citizen_name: Optional[str] = None
+
+
+class ComplaintUpdate(BaseModel):
+    status: Optional[str] = None
+    officer_notes: Optional[str] = None
+
+
+@app.post("/api/complaints")
+def create_complaint(c: ComplaintCreate):
+    db = get_session()
+    try:
+        existing = db.query(Complaint).filter(Complaint.id == c.id).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="A complaint with this ID already exists.")
+        row = Complaint(**c.dict())
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return serialize(row)
+    finally:
+        db.close()
+
+
+@app.get("/api/complaints")
+def list_complaints():
+    db = get_session()
+    try:
+        rows = db.query(Complaint).order_by(Complaint.submitted_at.desc()).all()
+        return [serialize(r) for r in rows]
+    finally:
+        db.close()
+
+
+@app.get("/api/complaints/{complaint_id}")
+def get_complaint(complaint_id: str):
+    db = get_session()
+    try:
+        row = db.query(Complaint).filter(Complaint.id == complaint_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Complaint not found.")
+        return serialize(row)
+    finally:
+        db.close()
+
+
+@app.patch("/api/complaints/{complaint_id}")
+def update_complaint(complaint_id: str, u: ComplaintUpdate):
+    db = get_session()
+    try:
+        row = db.query(Complaint).filter(Complaint.id == complaint_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Complaint not found.")
+        if u.status is not None:
+            row.status = u.status
+        if u.officer_notes is not None:
+            row.officer_notes = u.officer_notes
+        db.commit()
+        db.refresh(row)
+        return serialize(row)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
