@@ -1,13 +1,22 @@
 """
 NagrikSeva Enterprise — backend API.
 
-Step 3:
-- Citizen registration
-- Citizen login using email + password
-- Signed authentication token
-- /api/me endpoint
+Run locally with:
+    uvicorn main:app --reload --port 8000
 
-Existing AI pipeline and complaint APIs are preserved.
+Endpoints:
+    GET  /                       -> service status
+    POST /api/pipeline           -> full AI recommendation
+    GET  /api/health             -> health check
+
+    POST /api/auth/register      -> citizen registration
+    POST /api/auth/login         -> citizen login
+    GET  /api/me                 -> current logged-in citizen
+
+    POST   /api/complaints       -> create complaint
+    GET    /api/complaints       -> list complaints
+    GET    /api/complaints/{id}  -> fetch complaint
+    PATCH  /api/complaints/{id}  -> update complaint
 """
 
 import base64
@@ -24,19 +33,46 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from decision_table import find_missing_fields, recommend_action, generate_explanation
+from decision_table import (
+    find_missing_fields,
+    recommend_action,
+    generate_explanation,
+)
 from groq_client import extract_fields, GroqError
 from database import User, Complaint, get_session, init_db, serialize
 
 
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
 load_dotenv()
+
+
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI(title="NagrikSeva Enterprise API")
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "NagrikSeva Enterprise API",
+        "health": "/api/health",
+        "docs": "/docs",
+    }
+
+
+# ============================================================
 # CORS
-# ---------------------------------------------------------------------------
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,30 +82,34 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # DATABASE STARTUP
-# ---------------------------------------------------------------------------
+# ============================================================
 
 @app.on_event("startup")
 def on_startup():
     try:
         init_db()
+        print("[startup] Database initialized successfully.")
     except Exception as e:
         print(f"[startup] Database init skipped/failed: {e}")
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # HEALTH
-# ---------------------------------------------------------------------------
+# ============================================================
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "NagrikSeva Enterprise API",
+    }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # AUTHENTICATION
-# ---------------------------------------------------------------------------
+# ============================================================
 
 class RegisterRequest(BaseModel):
     name: str = Field(min_length=2, max_length=100)
@@ -95,11 +135,21 @@ def normalize_mobile(mobile: str) -> str:
 
 
 def is_valid_email(email: str) -> bool:
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email))
+    return bool(
+        re.fullmatch(
+            r"[^@\s]+@[^@\s]+\.[^@\s]+",
+            email,
+        )
+    )
 
+
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
 
 def hash_password(password: str) -> str:
     """PBKDF2-HMAC-SHA256 password hash."""
+
     iterations = 310_000
     salt = secrets.token_bytes(16)
 
@@ -110,13 +160,21 @@ def hash_password(password: str) -> str:
         iterations,
     )
 
-    return f"pbkdf2_sha256${iterations}${salt.hex()}${password_hash.hex()}"
+    return (
+        f"pbkdf2_sha256$"
+        f"{iterations}$"
+        f"{salt.hex()}$"
+        f"{password_hash.hex()}"
+    )
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
     """Verify a password against the stored PBKDF2 hash."""
+
     try:
-        algorithm, iterations_text, salt_hex, hash_hex = stored_hash.split("$")
+        algorithm, iterations_text, salt_hex, hash_hex = (
+            stored_hash.split("$")
+        )
 
         if algorithm != "pbkdf2_sha256":
             return False
@@ -132,20 +190,21 @@ def verify_password(password: str, stored_hash: str) -> bool:
             iterations,
         )
 
-        return hmac.compare_digest(actual_hash, expected_hash)
+        return hmac.compare_digest(
+            actual_hash,
+            expected_hash,
+        )
 
     except (ValueError, TypeError):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Signed authentication token
-#
-# Set NAGRIKSEVA_AUTH_SECRET in Render/local .env for a stable production
-# secret. A temporary development secret is generated if it is missing.
-# ---------------------------------------------------------------------------
+# ============================================================
+# AUTH TOKEN
+# ============================================================
 
 AUTH_SECRET = os.environ.get("NAGRIKSEVA_AUTH_SECRET")
+
 
 if not AUTH_SECRET:
     AUTH_SECRET = secrets.token_urlsafe(32)
@@ -184,7 +243,10 @@ def create_auth_token(user_id: int) -> str:
     return f"{payload_b64}.{signature_b64}"
 
 
-def get_current_user_id(authorization: str | None) -> int:
+def get_current_user_id(
+    authorization: str | None,
+) -> int:
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
@@ -203,7 +265,8 @@ def get_current_user_id(authorization: str | None) -> int:
         ).digest()
 
         supplied_signature = base64.urlsafe_b64decode(
-            signature_b64 + "=" * (-len(signature_b64) % 4)
+            signature_b64
+            + "=" * (-len(signature_b64) % 4)
         )
 
         if not hmac.compare_digest(
@@ -217,7 +280,8 @@ def get_current_user_id(authorization: str | None) -> int:
 
         payload = json.loads(
             base64.urlsafe_b64decode(
-                payload_b64 + "=" * (-len(payload_b64) % 4)
+                payload_b64
+                + "=" * (-len(payload_b64) % 4)
             ).decode("utf-8")
         )
 
@@ -231,6 +295,7 @@ def get_current_user_id(authorization: str | None) -> int:
 
     except HTTPException:
         raise
+
     except Exception:
         raise HTTPException(
             status_code=401,
@@ -238,14 +303,22 @@ def get_current_user_id(authorization: str | None) -> int:
         )
 
 
+# ============================================================
+# REGISTER
+# ============================================================
+
 @app.post("/api/auth/register")
 def register_user(req: RegisterRequest):
+
     name = req.name.strip()
     mobile = normalize_mobile(req.mobile)
     email = normalize_email(req.email)
 
     if not name:
-        raise HTTPException(status_code=400, detail="Name is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="Name is required.",
+        )
 
     if not is_valid_email(email):
         raise HTTPException(
@@ -257,10 +330,17 @@ def register_user(req: RegisterRequest):
 
     if mobile_for_check.startswith("+91"):
         mobile_for_check = mobile_for_check[3:]
-    elif mobile_for_check.startswith("91") and len(mobile_for_check) == 12:
+
+    elif (
+        mobile_for_check.startswith("91")
+        and len(mobile_for_check) == 12
+    ):
         mobile_for_check = mobile_for_check[2:]
 
-    if not re.fullmatch(r"[6-9]\d{9}", mobile_for_check):
+    if not re.fullmatch(
+        r"[6-9]\d{9}",
+        mobile_for_check,
+    ):
         raise HTTPException(
             status_code=400,
             detail="Please enter a valid 10-digit mobile number.",
@@ -275,6 +355,7 @@ def register_user(req: RegisterRequest):
     db = get_session()
 
     try:
+
         existing_email = (
             db.query(User)
             .filter(User.email == email)
@@ -317,21 +398,29 @@ def register_user(req: RegisterRequest):
         db.close()
 
 
+# ============================================================
+# LOGIN
+# ============================================================
+
 @app.post("/api/auth/login")
 def login_user(req: LoginRequest):
+
     email = normalize_email(req.email)
 
     db = get_session()
 
     try:
+
         user = (
             db.query(User)
             .filter(User.email == email)
             .first()
         )
 
-        # Same response for unknown email and wrong password.
-        if not user or not verify_password(req.password, user.password_hash):
+        if not user or not verify_password(
+            req.password,
+            user.password_hash,
+        ):
             raise HTTPException(
                 status_code=401,
                 detail="Invalid email or password.",
@@ -357,13 +446,21 @@ def login_user(req: LoginRequest):
         db.close()
 
 
+# ============================================================
+# CURRENT USER
+# ============================================================
+
 @app.get("/api/me")
-def get_me(authorization: str | None = Header(default=None)):
+def get_me(
+    authorization: str | None = Header(default=None),
+):
+
     user_id = get_current_user_id(authorization)
 
     db = get_session()
 
     try:
+
         user = (
             db.query(User)
             .filter(User.id == user_id)
@@ -394,9 +491,9 @@ def get_me(authorization: str | None = Header(default=None)):
         db.close()
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # AI PIPELINE
-# ---------------------------------------------------------------------------
+# ============================================================
 
 class ComplaintRequest(BaseModel):
     complaint_text: str
@@ -404,6 +501,7 @@ class ComplaintRequest(BaseModel):
 
 @app.post("/api/pipeline")
 def run_pipeline(req: ComplaintRequest):
+
     complaint_text = req.complaint_text.strip()
 
     if not complaint_text:
@@ -415,13 +513,22 @@ def run_pipeline(req: ComplaintRequest):
     if len(complaint_text) > 1200:
         raise HTTPException(
             status_code=400,
-            detail="complaint_text is too long (max 1200 characters).",
+            detail=(
+                "complaint_text is too long "
+                "(max 1200 characters)."
+            ),
         )
 
     try:
+
         fields = extract_fields(complaint_text)
+
     except GroqError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=str(e),
+        )
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -456,9 +563,9 @@ def run_pipeline(req: ComplaintRequest):
     }
 
 
-# ---------------------------------------------------------------------------
-# COMPLAINTS DATABASE
-# ---------------------------------------------------------------------------
+# ============================================================
+# COMPLAINTS
+# ============================================================
 
 class ComplaintCreate(BaseModel):
     id: str
@@ -482,9 +589,11 @@ class ComplaintUpdate(BaseModel):
 
 @app.post("/api/complaints")
 def create_complaint(c: ComplaintCreate):
+
     db = get_session()
 
     try:
+
         existing = (
             db.query(Complaint)
             .filter(Complaint.id == c.id)
@@ -498,6 +607,7 @@ def create_complaint(c: ComplaintCreate):
             )
 
         row = Complaint(**c.model_dump())
+
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -510,9 +620,11 @@ def create_complaint(c: ComplaintCreate):
 
 @app.get("/api/complaints")
 def list_complaints():
+
     db = get_session()
 
     try:
+
         rows = (
             db.query(Complaint)
             .order_by(Complaint.submitted_at.desc())
@@ -527,9 +639,11 @@ def list_complaints():
 
 @app.get("/api/complaints/{complaint_id}")
 def get_complaint(complaint_id: str):
+
     db = get_session()
 
     try:
+
         row = (
             db.query(Complaint)
             .filter(Complaint.id == complaint_id)
@@ -553,9 +667,11 @@ def update_complaint(
     complaint_id: str,
     u: ComplaintUpdate,
 ):
+
     db = get_session()
 
     try:
+
         row = (
             db.query(Complaint)
             .filter(Complaint.id == complaint_id)
@@ -583,11 +699,12 @@ def update_complaint(
         db.close()
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # LOCAL RUN
-# ---------------------------------------------------------------------------
+# ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
