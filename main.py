@@ -27,7 +27,7 @@ load_dotenv()
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from database import User, Complaint, get_session, init_db, serialize
@@ -349,12 +349,16 @@ class ComplaintUpdate(BaseModel):
 
 
 @app.post("/api/complaints")
-def create_complaint(c: ComplaintCreate):
+def create_complaint(c: ComplaintCreate, authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
     db = get_session()
     try:
         if db.query(Complaint).filter(Complaint.id == c.id).first():
             raise HTTPException(status_code=409, detail="A complaint with this ID already exists.")
-        row = Complaint(**c.model_dump())
+        data = c.model_dump()
+        # Ownership is always taken from the authenticated token, never from the browser.
+        data["user_id"] = user_id
+        row = Complaint(**data)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -365,6 +369,20 @@ def create_complaint(c: ComplaintCreate):
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="A complaint with this ID already exists.")
+    finally:
+        db.close()
+
+
+@app.get("/api/my-complaints")
+def list_my_complaints(authorization: str | None = Header(default=None)):
+    user_id = get_current_user_id(authorization)
+    db = get_session()
+    try:
+        rows = (db.query(Complaint)
+                  .filter(Complaint.user_id == user_id)
+                  .order_by(Complaint.submitted_at.desc())
+                  .all())
+        return [serialize(row) for row in rows]
     finally:
         db.close()
 
